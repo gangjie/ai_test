@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    container_name: ai-test-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=FastAPI App
+      - DEBUG=false
+      - API_V1_PREFIX=/api/v1
+      - DATABASE_URL=sqlite+aiosqlite:///./data/app.db
+      - REPO_STORAGE_PATH=./repos
+    volumes:
+      - backend-data:/app/data
+      - backend-repos:/app/repos
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./vue-project
+      dockerfile: Dockerfile
+    container_name: ai-test-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  backend-data:
+  backend-repos:
