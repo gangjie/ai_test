@@ -29,7 +29,7 @@ services:
 
   frontend:
     build:
-      context: ./vue-project
+      context: ./test
       dockerfile: Dockerfile
     container_name: ai-test-frontend
     restart: unless-stopped
