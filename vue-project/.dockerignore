@@ -8,4 +8,3 @@ dist/
 .vscode/
 Dockerfile
 .dockerignore
-nginx.conf
