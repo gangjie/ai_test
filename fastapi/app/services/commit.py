@@ -108,6 +108,7 @@ class CommitAnalysisService:
             f"--format={fmt}",
             "--numstat",
             "--all",
+            "--no-merges",  # 排除合并提交，避免将合并人的代码统计归到合并人而非原作者头上
         ]
 
         # Windows 上需要指定 UTF-8 编码，否则中文字符会乱码
