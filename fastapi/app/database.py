@@ -41,8 +41,13 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """初始化数据库，创建所有表"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        # 表已存在时忽略错误（多worker竞争或数据库已初始化）
+        if "already exists" not in str(e):
+            raise
 
 
 async def close_db():
