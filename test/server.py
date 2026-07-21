@@ -4,7 +4,7 @@ import sys
 import urllib.request
 
 
-BACKEND_URL = "http://backend:8000"
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8000")
 
 
 class ProxyHandler(http.server.SimpleHTTPRequestHandler):
