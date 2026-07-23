@@ -51,6 +51,16 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    return {
+        "app": settings.APP_NAME,
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "api_prefix": settings.API_V1_PREFIX,
+    }
+
+
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():
     return get_swagger_ui_html(
