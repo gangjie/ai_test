@@ -43,10 +43,25 @@
         </div>
       </template>
       <el-table :data="repos" v-loading="reposLoading" stripe>
-        <el-table-column prop="name" label="仓库名称" />
-        <el-table-column prop="path" label="本地路径" />
-        <el-table-column label="操作" width="120">
+        <el-table-column prop="name" label="仓库名称" min-width="130" />
+        <el-table-column prop="url" label="仓库地址" min-width="200" show-overflow-tooltip />
+        <el-table-column prop="branch" label="分支" width="100" />
+        <el-table-column prop="path" label="本地路径" min-width="150" show-overflow-tooltip />
+        <el-table-column label="克隆时间" width="160">
           <template #default="{ row }">
+            {{ row.cloned_at ? formatTime(row.cloned_at) : '-' }}
+          </template>
+        </el-table-column>
+        <el-table-column label="最后拉取" width="160">
+          <template #default="{ row }">
+            {{ row.last_pulled_at ? formatTime(row.last_pulled_at) : '未拉取' }}
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="160" fixed="right">
+          <template #default="{ row }">
+            <el-button type="primary" size="small" @click="handlePull(row.name)" :loading="pullingRepo === row.name" style="margin-right: 8px">
+              拉取
+            </el-button>
             <el-popconfirm :title="`确定删除仓库 &quot;${row.name}&quot; 吗？`" @confirm="handleDelete(row.name)">
               <template #reference><el-button type="danger" size="small">删除</el-button></template>
             </el-popconfirm>
@@ -54,6 +69,28 @@
         </el-table-column>
       </el-table>
     </el-card>
+
+    <!-- 拉取进度对话框 -->
+    <el-dialog v-model="pullDialogVisible" title="拉取进度" width="500px" :close-on-click-modal="false">
+      <div v-if="pullResult">
+        <el-alert
+          :title="pullResult.success ? '拉取成功' : '拉取失败'"
+          :type="pullResult.success ? 'success' : 'error'"
+          show-icon
+          :closable="false"
+        />
+        <p style="margin-top: 12px">{{ pullResult.message }}</p>
+        <p v-if="pullResult.new_commits > 0">新提交数量：{{ pullResult.new_commits }}</p>
+        <p v-if="pullResult.success">正在后台分析中，请稍后查看提交记录...</p>
+      </div>
+      <div v-else style="text-align:center;padding:20px">
+        <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+        <p>正在拉取最新提交...</p>
+      </div>
+      <template #footer>
+        <el-button @click="pullDialogVisible = false" :disabled="!pullResult">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -61,6 +98,7 @@
 import { ref, onMounted } from 'vue'
 import { api } from '@/api'
 import { ElMessage } from 'element-plus'
+import { Loading } from '@element-plus/icons-vue'
 
 const cloneForm = ref({ url: '', branch: '', directory: '', depth: null, username: '', password: '' })
 const cloning = ref(false)
@@ -69,6 +107,10 @@ const cloneSuccess = ref(false)
 
 const repos = ref([])
 const reposLoading = ref(false)
+
+const pullDialogVisible = ref(false)
+const pullResult = ref(null)
+const pullingRepo = ref('')
 
 const loadRepos = async () => {
   reposLoading.value = true
@@ -94,9 +136,31 @@ const handleClone = async () => {
   finally { cloning.value = false }
 }
 
+const handlePull = async (name) => {
+  pullDialogVisible.value = true
+  pullResult.value = null
+  pullingRepo.value = name
+  try {
+    const res = await api.pullRepo(name)
+    pullResult.value = res
+    loadRepos()
+  } catch (e) {
+    pullResult.value = { success: false, message: '拉取失败: ' + e.message, repo_name: name, new_commits: 0 }
+  } finally {
+    pullingRepo.value = ''
+  }
+}
+
 const handleDelete = async (name) => {
   try { await api.deleteRepo(name); loadRepos() }
   catch (e) { ElMessage.error('删除失败: ' + e.message) }
+}
+
+const formatTime = (isoStr) => {
+  if (!isoStr) return '-'
+  const d = new Date(isoStr)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
 onMounted(loadRepos)

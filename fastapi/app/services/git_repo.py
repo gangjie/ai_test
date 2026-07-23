@@ -6,9 +6,12 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, quote
 
+from sqlalchemy import select
+
 from app.config import settings
 from app.database import async_session
-from app.schemas.git_repo import GitCloneRequest, GitCloneResponse
+from app.models.git_repo import GitRepoInfo
+from app.schemas.git_repo import GitCloneRequest, GitCloneResponse, GitPullResponse
 from app.services.commit import CommitAnalysisService
 
 logger = logging.getLogger(__name__)
@@ -17,7 +20,7 @@ logger = logging.getLogger(__name__)
 class GitService:
     """
     Git 操作服务类
-    封装 git clone 等操作
+    封装 git clone、git pull 等操作
     """
 
     def __init__(self):
@@ -86,6 +89,63 @@ class GitService:
         # 返回原始错误（去除多余换行）
         return stderr.strip()
 
+    @staticmethod
+    def _parse_pull_error(stderr: str) -> str:
+        """解析 git pull 错误信息，返回简洁提示"""
+        if not stderr:
+            return "未知错误"
+        if "Could not resolve host" in stderr:
+            return "无法解析远程仓库地址，请检查网络连接"
+        if "Connection refused" in stderr or "Connection was reset" in stderr:
+            return "连接被拒绝或重置，请检查网络或配置代理"
+        if "Authentication failed" in stderr:
+            return "认证失败，拉取需要认证的仓库需重新克隆"
+        if "timed out" in stderr.lower():
+            return "连接超时，请检查网络或配置代理"
+        if "local changes" in stderr.lower() and "would be overwritten" in stderr.lower():
+            return "本地有未提交的更改，请先处理后再拉取"
+        return stderr.strip()
+
+    async def _save_repo_info(self, data: GitCloneRequest, repo_name: str, target_path: Path):
+        """克隆成功后保存仓库信息到数据库"""
+        try:
+            async with async_session() as session:
+                # 检查是否已存在（防止重复）
+                result = await session.execute(
+                    select(GitRepoInfo).where(GitRepoInfo.repo_name == repo_name)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    return
+
+                repo_info = GitRepoInfo(
+                    repo_name=repo_name,
+                    repo_url=data.url,
+                    branch=data.branch,
+                    clone_depth=data.depth,
+                    local_path=str(target_path),
+                )
+                session.add(repo_info)
+                await session.commit()
+                logger.info(f"仓库信息已保存到数据库: {repo_name}")
+        except Exception as e:
+            logger.error(f"保存仓库信息失败: {e}")
+
+    async def _delete_repo_info(self, repo_name: str):
+        """从数据库删除仓库信息"""
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(GitRepoInfo).where(GitRepoInfo.repo_name == repo_name)
+                )
+                repo_info = result.scalar_one_or_none()
+                if repo_info:
+                    await session.delete(repo_info)
+                    await session.commit()
+                    logger.info(f"仓库信息已从数据库删除: {repo_name}")
+        except Exception as e:
+            logger.error(f"删除仓库信息失败: {e}")
+
     async def clone(self, data: GitCloneRequest) -> GitCloneResponse:
         """
         克隆 Git 仓库
@@ -132,6 +192,9 @@ class GitService:
             )
 
             if result.returncode == 0:
+                # 保存仓库信息到数据库
+                await self._save_repo_info(data, repo_name, target_path)
+
                 # 克隆成功后，异步触发提交记录分析
                 asyncio.create_task(
                     self._trigger_analysis(repo_name, str(target_path))
@@ -174,7 +237,39 @@ class GitService:
     async def list_repos(self) -> list[dict]:
         """
         列出所有已克隆的仓库
+        优先从数据库读取，回退到扫描目录
         """
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(GitRepoInfo).order_by(GitRepoInfo.cloned_at.desc())
+                )
+                db_repos = result.scalars().all()
+                if db_repos:
+                    # 过滤掉已被手动删除目录的记录
+                    repos = []
+                    for r in db_repos:
+                        repo_path = Path(r.local_path)
+                        if repo_path.exists() and (repo_path / ".git").exists():
+                            repos.append({
+                                "id": r.id,
+                                "name": r.repo_name,
+                                "url": r.repo_url,
+                                "branch": r.branch,
+                                "clone_depth": r.clone_depth,
+                                "path": r.local_path,
+                                "last_pulled_at": r.last_pulled_at.isoformat() if r.last_pulled_at else None,
+                                "cloned_at": r.cloned_at.isoformat() if r.cloned_at else None,
+                            })
+                        else:
+                            # 目录不存在，清理数据库记录
+                            await session.delete(r)
+                            await session.commit()
+                    return repos
+        except Exception as e:
+            logger.error(f"从数据库读取仓库列表失败: {e}")
+
+        # 回退：扫描目录
         repos = []
         if not self.storage_path.exists():
             return repos
@@ -186,6 +281,138 @@ class GitService:
                     "path": str(item),
                 })
         return repos
+
+    async def pull(self, repo_name: str) -> GitPullResponse:
+        """
+        拉取指定仓库的最新提交
+        :param repo_name: 仓库名称
+        :return: 拉取结果
+        """
+        target_path = self.storage_path / repo_name
+
+        # 检查仓库目录是否存在
+        if not target_path.exists() or not (target_path / ".git").exists():
+            return GitPullResponse(
+                success=False,
+                message=f"仓库 '{repo_name}' 不存在或不是 Git 仓库",
+                repo_name=repo_name,
+            )
+
+        # 构建 git pull 命令
+        cmd = ["git", "pull"]
+
+        # 先获取拉取前的 HEAD
+        head_before = await asyncio.to_thread(
+            self._run_git_cmd,
+            ["git", "rev-parse", "HEAD"],
+            target_path,
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(target_path),
+                timeout=120,
+            )
+
+            if result.returncode == 0:
+                # 获取拉取后的 HEAD
+                head_after = await asyncio.to_thread(
+                    self._run_git_cmd,
+                    ["git", "rev-parse", "HEAD"],
+                    target_path,
+                )
+
+                # 统计新提交数量
+                new_commits = 0
+                if head_before and head_after and head_before != head_after:
+                    count_cmd = ["git", "rev-list", "--count", f"{head_before}..{head_after}"]
+                    count_result = await asyncio.to_thread(
+                        subprocess.run,
+                        count_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=str(target_path),
+                        timeout=30,
+                    )
+                    if count_result.returncode == 0 and count_result.stdout.strip().isdigit():
+                        new_commits = int(count_result.stdout.strip())
+
+                # 更新数据库中的拉取时间
+                await self._update_pull_time(repo_name)
+
+                # 异步触发重新分析
+                asyncio.create_task(
+                    self._trigger_analysis(repo_name, str(target_path))
+                )
+
+                if new_commits > 0:
+                    message = f"拉取成功，发现 {new_commits} 个新提交，正在后台分析..."
+                else:
+                    message = "拉取成功，仓库已是最新"
+
+                return GitPullResponse(
+                    success=True,
+                    message=message,
+                    repo_name=repo_name,
+                    new_commits=new_commits,
+                )
+            else:
+                detail = result.stderr.strip() or result.stdout.strip() or f"git 退出码: {result.returncode}"
+                friendly_msg = self._parse_pull_error(detail)
+                return GitPullResponse(
+                    success=False,
+                    message=f"拉取失败: {friendly_msg}",
+                    repo_name=repo_name,
+                )
+
+        except subprocess.TimeoutExpired:
+            return GitPullResponse(
+                success=False,
+                message="拉取超时（超过2分钟）",
+                repo_name=repo_name,
+            )
+        except Exception as e:
+            return GitPullResponse(
+                success=False,
+                message=f"拉取异常: {str(e) or repr(e)}",
+                repo_name=repo_name,
+            )
+
+    @staticmethod
+    def _run_git_cmd(cmd: list[str], cwd: Path) -> str | None:
+        """执行 git 命令并返回 stdout 首行"""
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(cwd),
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    async def _update_pull_time(self, repo_name: str):
+        """更新仓库的最近拉取时间"""
+        try:
+            async with async_session() as session:
+                from datetime import datetime, timezone
+                result = await session.execute(
+                    select(GitRepoInfo).where(GitRepoInfo.repo_name == repo_name)
+                )
+                repo_info = result.scalar_one_or_none()
+                if repo_info:
+                    repo_info.last_pulled_at = datetime.now(timezone.utc)
+                    await session.commit()
+        except Exception as e:
+            logger.error(f"更新拉取时间失败: {e}")
 
     @staticmethod
     async def _trigger_analysis(repo_name: str, repo_path: str):
@@ -211,6 +438,8 @@ class GitService:
 
         target_path = self.storage_path / repo_name
         if not target_path.exists():
+            # 如果目录不存在，只清理数据库记录
+            await self._delete_repo_info(repo_name)
             return False
 
         def _do_delete():
@@ -259,4 +488,8 @@ class GitService:
             logger.error(f"删除仓库失败: {last_error}")
             return False
 
-        return await asyncio.to_thread(_do_delete)
+        success = await asyncio.to_thread(_do_delete)
+        # 清理数据库记录
+        if success:
+            await self._delete_repo_info(repo_name)
+        return success

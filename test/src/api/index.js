@@ -36,6 +36,9 @@ export const api = {
   // 删除仓库
   deleteRepo: (repoName) => request(`/git/repos/${encodeURIComponent(repoName)}`, { method: 'DELETE' }),
 
+  // 拉取仓库最新提交
+  pullRepo: (repoName) => request('/git/pull', { method: 'POST', body: { repo_name: repoName } }),
+
   // ========== 提交记录分析 ==========
   // 查询分析状态
   getAnalysisStatus: (repoName) => request(`/commits/status/${encodeURIComponent(repoName)}`),

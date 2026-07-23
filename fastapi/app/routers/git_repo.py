@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from app.schemas.git_repo import GitCloneRequest, GitCloneResponse
+from app.schemas.git_repo import GitCloneRequest, GitCloneResponse, GitPullRequest, GitPullResponse
 from app.services.git_repo import GitService
 
 router = APIRouter(prefix="/git", tags=["Git 仓库管理"])
@@ -31,6 +31,18 @@ async def list_repositories():
     service = GitService()
     repos = await service.list_repos()
     return {"total": len(repos), "repos": repos}
+
+
+@router.post("/pull", response_model=GitPullResponse, summary="拉取仓库最新提交")
+async def pull_repository(data: GitPullRequest):
+    """
+    拉取指定仓库的最新提交记录，拉取完成后自动触发提交记录分析
+
+    - **repo_name**: 仓库名称（必填）
+    """
+    service = GitService()
+    result = await service.pull(data.repo_name)
+    return result
 
 
 @router.delete("/repos/{repo_name}", summary="删除已克隆的仓库")
